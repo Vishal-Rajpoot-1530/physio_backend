@@ -1,0 +1,115 @@
+name: Deploy Physio Production
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: physioapi-production
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install exactly locked dependencies
+        run: npm ci
+      - name: Audit high-severity dependencies
+        run: npm audit --audit-level=high
+      - name: Build and Prisma Client (Linux)
+        env:
+          DATABASE_URL: mysql://placeholder:placeholder@127.0.0.1:3306/build_only
+        run: |
+          npx prisma validate
+          npx prisma generate
+          npm run build
+          test -f dist/main.js
+          test -x node_modules/.bin/prisma
+      - name: Package Linux runtime and Prisma CLI
+        run: tar -czf "${RUNNER_TEMP}/backend.tar.gz" dist prisma node_modules package.json package-lock.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: physioapi-${{ github.sha }}
+          path: ${{ runner.temp }}/backend.tar.gz
+          retention-days: 3
+
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_AUTO_DEPLOY == 'true'
+    needs: build
+    environment: production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: physioapi-${{ github.sha }}
+          path: ${{ runner.temp }}/release
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+          role-session-name: physioapi-GitHubDeploy
+      - name: Verify AWS caller and calculate runner IP
+        id: runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity --query Arn --output text
+          IP="$(curl -4 -fsS --retry 3 https://checkip.amazonaws.com | tr -d '\r\n')"
+          [[ "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || exit 1
+          echo "cidr=$IP/32" >> "$GITHUB_OUTPUT"
+      - name: Open temporary SSH rule for this runner
+        id: ingress
+        env:
+          SG_ID: ${{ secrets.EC2_SECURITY_GROUP_ID }}
+          CIDR: ${{ steps.runner.outputs.cidr }}
+        run: |
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" \
+            --protocol tcp --port 22 --cidr "$CIDR"
+      - name: Verify SSH host identity and deploy
+        env:
+          SERVER: ${{ secrets.EC2_HOST }}
+          USER: ${{ secrets.EC2_USER }}
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EXPECTED_FINGERPRINT: ${{ vars.EC2_HOST_FINGERPRINT }}
+          APP_NAME: physioapi
+          SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -n "$EXPECTED_FINGERPRINT"
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          ssh-keyscan -T 15 -t ed25519 "$SERVER" 2>/dev/null > ~/.ssh/known_hosts
+          test -s ~/.ssh/known_hosts
+          ACTUAL="$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}')"
+          test "$ACTUAL" = "$EXPECTED_FINGERPRINT" || { echo 'SSH host fingerprint mismatch' >&2; exit 1; }
+          SSH_OPTS=(-i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes)
+          ssh "${SSH_OPTS[@]}" "$USER@$SERVER" "mkdir -p /var/www/mobile-app-services/$APP_NAME/.incoming"
+          scp "${SSH_OPTS[@]}" "${RUNNER_TEMP}/release/backend.tar.gz" \
+            "$USER@$SERVER:/var/www/mobile-app-services/$APP_NAME/.incoming/$SHA.tar.gz"
+          ssh "${SSH_OPTS[@]}" "$USER@$SERVER" \
+            "bash -s -- '$APP_NAME' '$SHA'" < scripts/deploy-remote.sh
+      - name: Close temporary SSH rule (even if deployment fails)
+        if: always() && steps.ingress.outcome == 'success'
+        env:
+          SG_ID: ${{ secrets.EC2_SECURITY_GROUP_ID }}
+          CIDR: ${{ steps.runner.outputs.cidr }}
+        run: |
+          aws ec2 revoke-security-group-ingress \
+            --group-id "$SG_ID" \
+            --protocol tcp --port 22 --cidr "$CIDR"

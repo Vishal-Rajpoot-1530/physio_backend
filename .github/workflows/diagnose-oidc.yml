@@ -1,0 +1,47 @@
+﻿name: Diagnose AWS OIDC
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    environment: production
+
+    steps:
+      - name: Inspect non-sensitive OIDC claims
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import json
+          import base64
+          import urllib.request
+          import urllib.parse
+
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+          token = os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
+
+          separator = "&" if "?" in url else "?"
+          url += separator + "audience=" + urllib.parse.quote("sts.amazonaws.com")
+
+          request = urllib.request.Request(
+              url,
+              headers={"Authorization": "Bearer " + token}
+          )
+
+          with urllib.request.urlopen(request) as response:
+              jwt = json.load(response)["value"]
+
+          payload = jwt.split(".")[1]
+          payload += "=" * (-len(payload) % 4)
+
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+
+          for key in ("iss", "aud", "sub", "repository", "environment", "ref"):
+              print(f"{key}: {claims.get(key, 'NOT PRESENT')}")
+          PY

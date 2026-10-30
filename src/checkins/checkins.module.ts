@@ -1,0 +1,1 @@
+import{Module}from'@nestjs/common';import{AuthModule}from'../auth/auth.module';import{CheckinsController}from'./checkins.controller';@Module({imports:[AuthModule],controllers:[CheckinsController]})export class CheckinsModule{}

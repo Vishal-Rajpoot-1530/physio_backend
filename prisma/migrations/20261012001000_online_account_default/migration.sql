@@ -1,0 +1,2 @@
+ALTER TABLE `admins`
+MODIFY `type` VARCHAR(10) NOT NULL DEFAULT 'online';
